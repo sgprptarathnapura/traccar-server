@@ -1,0 +1,35 @@
+FROM eclipse-temurin:25-jdk AS build
+
+WORKDIR /source
+COPY . .
+RUN ./gradlew assemble --no-daemon
+
+FROM eclipse-temurin:25 AS jdk
+
+RUN jlink \
+    --add-modules java.se,jdk.charsets,jdk.crypto.ec,jdk.unsupported \
+    --strip-debug \
+    --no-header-files \
+    --no-man-pages \
+    --compress=2 \
+    --output /jre
+
+FROM ubuntu:24.04
+
+WORKDIR /opt/traccar
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /source/target/tracker-server.jar ./
+COPY --from=build /source/target/lib ./lib
+COPY --from=build /source/schema ./schema
+COPY --from=build /source/templates ./templates
+COPY --from=build /source/setup/traccar.xml ./conf/traccar.xml
+COPY --from=jdk /jre ./jre
+
+RUN mkdir -p web override logs data
+
+ENTRYPOINT ["/opt/traccar/jre/bin/java"]
+CMD ["-jar", "tracker-server.jar", "conf/traccar.xml"]

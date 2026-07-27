@@ -1,0 +1,332 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    outputs:
+      # Pass the immutable commit-SHA image tag to the deployment job.
+      image: ${{ steps.image.outputs.ref }}
+
+    steps:
+      # Download the source code that triggered this workflow.
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      # Install JDK 21 and restore Gradle's dependency cache.
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      # Compile the server and run its tests before publishing an image.
+      - name: Build and test
+        # ./gradlew build: compile Java, run unit tests, and fail the workflow if either fails.
+        # --no-daemon: avoid leaving a Gradle daemon process on the ephemeral runner.
+        # --stacktrace: print full error details if the build fails.
+        run: ./gradlew build --no-daemon --stacktrace
+
+      # Build the private GHCR image name and immutable tag for this commit.
+      - name: Set image reference
+        id: image
+        shell: bash
+        run: |
+          # Lowercase the repository owner because GHCR image names must be lowercase.
+          image_name="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/traccar-server"
+          # Expose the base image name for the docker/build-push-action tags section.
+          echo "name=${image_name}" >> "$GITHUB_OUTPUT"
+          # Expose the immutable SHA-tagged image for the deploy job.
+          echo "ref=${image_name}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      # Enable Docker Buildx, which supports cache import/export in GitHub Actions.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Authenticate the GitHub runner so it can push the private image to GHCR.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build Dockerfile.server and publish both immutable and latest image tags.
+      - name: Build and publish image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    # Do not deploy unless the image build and publication completed successfully.
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    # Load production-scoped GitHub variables and secrets for this job.
+    environment: production
+
+    steps:
+      # Check out the Compose file that will be copied to the Droplet.
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      # Create the SSH client files used by later ssh and scp commands.
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DROPLET_KNOWN_HOSTS }}
+        run: |
+          # Create ~/.ssh with owner-only access so OpenSSH accepts it.
+          install -m 700 -d ~/.ssh
+          # Write the private deployment key from the GitHub secret.
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          # Restrict private-key permissions; OpenSSH rejects world-readable keys.
+          chmod 600 ~/.ssh/id_ed25519
+          # Write the verified Droplet host key so SSH can authenticate the server.
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      # Copy database configuration from GitHub Variables/Secrets to Droplet .env.
+      - name: Transfer deployment environment
+        shell: bash
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+          POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+          POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          # Fail early if any required database setting is empty.
+          test -n "$POSTGRES_DB"
+          test -n "$POSTGRES_USER"
+          test -n "$POSTGRES_PASSWORD"
+
+          # Create temporary files as owner-readable only.
+          umask 077
+          # Write Compose database settings into a temporary runner-side .env file.
+          {
+            printf 'POSTGRES_DB=%s\n' "$POSTGRES_DB"
+            printf 'POSTGRES_USER=%s\n' "$POSTGRES_USER"
+            printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
+          } > deployment.env
+
+          # Create the Droplet deployment directory if it does not exist.
+          ssh "${DROPLET_USER}@${DROPLET_HOST}" "mkdir -p /opt/traccar/deploy"
+          # Upload the temporary .env file over SSH; the Droplet does not pull from GitHub.
+          scp deployment.env "${DROPLET_USER}@${DROPLET_HOST}:/tmp/traccar.env"
+          # On the Droplet: install the .env, keep previous TRACCAR_IMAGE for rollback.
+          ssh "${DROPLET_USER}@${DROPLET_HOST}" 'bash -s' <<'REMOTE'
+          # Exit immediately on error, undefined variables, or failed pipelines.
+          set -euo pipefail
+          deploy_dir=/opt/traccar/deploy
+          env_file="${deploy_dir}/.env"
+          previous_image=""
+          # Preserve the currently deployed image tag before overwriting .env.
+          if [ -f "$env_file" ]; then
+            previous_image="$(sed -n 's/^TRACCAR_IMAGE=//p' "$env_file" | tail -n 1)"
+          fi
+          # Move the uploaded file into place with owner-only permissions.
+          install -m 600 /tmp/traccar.env "$env_file"
+          # Remove the temporary upload path.
+          rm -f /tmp/traccar.env
+          # Re-append the previous image so rollback still has a known good tag.
+          if [ -n "$previous_image" ]; then
+            printf 'TRACCAR_IMAGE=%s\n' "$previous_image" >> "$env_file"
+          fi
+          REMOTE
+          # Delete the temporary runner-side .env file after transfer.
+          rm -f deployment.env
+
+      # SSH into the Droplet and make its Docker client able to pull private GHCR images.
+      - name: Log Droplet in to GHCR
+        shell: bash
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          # Send the read token through SSH stdin so it is not stored in shell history.
+          # GitHub Actions SSHs to the Droplet; the Droplet Docker client logs into GHCR.
+          printf '%s' "$GHCR_READ_TOKEN" |
+            ssh "${DROPLET_USER}@${DROPLET_HOST}" \
+              "docker login ghcr.io --username '${GHCR_USERNAME}' --password-stdin"
+
+      # Send the repository Compose configuration to the deployment directory on the Droplet.
+      - name: Upload Compose configuration
+        shell: bash
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+        run: |
+          # Ensure the Droplet deployment directory exists.
+          ssh "${DROPLET_USER}@${DROPLET_HOST}" "mkdir -p /opt/traccar/deploy"
+          # Upload the Compose file from this repository to the Droplet.
+          scp docker/compose/traccar-compose.yaml \
+            "${DROPLET_USER}@${DROPLET_HOST}:/opt/traccar/deploy/traccar-compose.yaml"
+
+      # Pull the new immutable image, start services, wait for health, and roll back on failure.
+      - name: Deploy and verify
+        shell: bash
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+          IMAGE_REF: ${{ needs.build-and-publish.outputs.image }}
+        run: |
+          # Run the deployment script remotely on the Droplet; $IMAGE_REF becomes $1 there.
+          ssh "${DROPLET_USER}@${DROPLET_HOST}" bash -s -- "$IMAGE_REF" <<'REMOTE'
+          # Exit on error, undefined variables, or failed pipelines; ERR triggers rollback.
+          set -Eeuo pipefail
+
+          # New immutable image tag published by the build-and-publish job.
+          image_ref="$1"
+          deploy_dir="/opt/traccar/deploy"
+          env_file="${deploy_dir}/.env"
+          compose_file="${deploy_dir}/traccar-compose.yaml"
+
+          # Work inside the Droplet deployment directory.
+          cd "$deploy_dir"
+          # Require .env so Compose has database credentials and image settings.
+          test -f "$env_file"
+
+          # Remember the active image before replacing it with this deployment's SHA tag.
+          previous_image="$(sed -n 's/^TRACCAR_IMAGE=//p' "$env_file" | tail -n 1)"
+
+          # Update only the image reference in the Droplet .env file.
+          set_image() {
+            local value="$1"
+            if grep -q '^TRACCAR_IMAGE=' "$env_file"; then
+              # Replace the existing TRACCAR_IMAGE line.
+              sed -i "s|^TRACCAR_IMAGE=.*|TRACCAR_IMAGE=${value}|" "$env_file"
+            else
+              # Append TRACCAR_IMAGE if the key is missing.
+              printf '\nTRACCAR_IMAGE=%s\n' "$value" >> "$env_file"
+            fi
+          }
+
+          # Always run Compose against the transferred Compose file and private .env file.
+          compose() {
+            docker compose --env-file "$env_file" -f "$compose_file" "$@"
+          }
+
+          # Restore the prior image if pulling, starting, or health verification fails.
+          rollback() {
+            # Prevent recursive rollback if restore itself fails.
+            trap - ERR
+            echo "Deployment failed"
+            # Show recent Traccar logs to help diagnose the failure.
+            compose logs --tail=100 traccar || true
+            if [ -n "$previous_image" ] && [ "$previous_image" != "$image_ref" ]; then
+              echo "Rolling back to ${previous_image}"
+              # Point Compose back at the previous known-good image.
+              set_image "$previous_image"
+              # Re-pull the previous image and restart only the Traccar service.
+              compose pull traccar
+              compose up -d --no-deps traccar
+            else
+              echo "No previous image is available for rollback"
+            fi
+            exit 1
+          }
+
+          # Call rollback automatically when any later command fails.
+          trap rollback ERR
+
+          # Write the new SHA-tagged image into .env.
+          set_image "$image_ref"
+          # Download the new private image from GHCR to the Droplet.
+          compose pull traccar
+          # Create or update database and Traccar containers without destroying named volumes.
+          compose up -d
+
+          # Resolve the running Traccar container ID.
+          container_id="$(compose ps -q traccar)"
+          # Fail if Compose did not start a Traccar container.
+          test -n "$container_id"
+
+          # Wait up to five minutes for Docker's Traccar health check to pass.
+          for _ in $(seq 1 60); do
+            # Read the container health status reported by Docker.
+            status="$(docker inspect --format '{{.State.Health.Status}}' "$container_id")"
+            if [ "$status" = "healthy" ]; then
+              # Clear the rollback trap after a successful health check.
+              trap - ERR
+              echo "Deployment succeeded: ${image_ref}"
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              # Trigger the ERR trap and roll back immediately.
+              false
+            fi
+            # Wait before the next health poll.
+            sleep 5
+          done
+
+          echo "Timed out waiting for Traccar health check"
+          # Trigger the ERR trap after the health-check timeout.
+          false
+          REMOTE
+
+# Production environment configuration
+# Configure the following at:
+# Repository Settings > Environments > production > Environment variables / Environment secrets.
+#
+# Variables:
+#   POSTGRES_DB
+#     Database name, for example: traccardb
+#   POSTGRES_USER
+#     Database user, for example: sgprpta
+#
+# Secrets:
+#   POSTGRES_PASSWORD
+#     Strong password for POSTGRES_USER. Use an alphanumeric value initially to avoid .env escaping issues.
+#   DROPLET_HOST
+#     Public Droplet IP address or DNS name, for example: 203.0.113.10
+#   DROPLET_USER
+#     Linux user that runs Docker on the Droplet, for example: deploy
+#   DROPLET_SSH_KEY
+#     Private part of a dedicated SSH key created locally:
+#       ssh-keygen -t ed25519 -C "github-actions-traccar" -f github-actions-traccar
+#     Put github-actions-traccar.pub in /home/<DROPLET_USER>/.ssh/authorized_keys on the Droplet.
+#     Copy the full github-actions-traccar private-key file content into this GitHub secret.
+#   DROPLET_KNOWN_HOSTS
+#     Verified SSH host-key entry for the Droplet, generated locally:
+#       ssh-keyscan -H <DROPLET_HOST>
+#     Verify the ed25519 fingerprint before saving the output as this secret.
+#   GHCR_USERNAME
+#     GitHub username that owns the read token, for example: your-github-username
+#   GHCR_READ_TOKEN
+#     GitHub classic personal access token with read:packages permission.
+#     The Droplet Docker client uses it to pull the private GHCR image.
+#
+# Built-in GitHub Actions values; do not create these manually:
+#   secrets.GITHUB_TOKEN
+#     Short-lived token automatically issued to this workflow. packages: write lets it push to GHCR.
+#   github.actor
+#     GitHub user or app that triggered the workflow; used as the GHCR publishing username.
+#   GITHUB_REPOSITORY_OWNER
+#     Account or organization that owns the repository; used in the GHCR image path.
+#   GITHUB_SHA
+#     Commit hash that triggered the workflow; used to create an immutable image tag.
+#   GITHUB_OUTPUT
+#     GitHub-provided output file; the image-reference step writes values for later steps/jobs.
