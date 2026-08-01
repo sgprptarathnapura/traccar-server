@@ -38,7 +38,7 @@ services:
       start_period: 2m
       retries: 3
     ports:
-      - "127.0.0.1:8082:8082"
+      - "8082:8082"
       - "5023:5023/tcp" # GT06
       - "5027:5027/tcp" # Teltonika
     volumes:
