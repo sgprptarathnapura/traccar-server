@@ -32,7 +32,7 @@ services:
       DATABASE_URL: jdbc:postgresql://database:5432/${POSTGRES_DB:?POSTGRES_DB is required}
       DATABASE_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
       DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-      PROTOCOLS_ENABLE: gt06,teltonika
+      PROTOCOLS_ENABLE: h02,gt06,teltonika
     healthcheck:
       test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8082/api/health" ]
       interval: 30s
@@ -41,6 +41,7 @@ services:
       retries: 3
     ports:
       - "8082:8082"
+      - "5013:5013/tcp" # h02
       - "5023:5023/tcp" # GT06
       - "5027:5027/tcp" # Teltonika
     volumes:
