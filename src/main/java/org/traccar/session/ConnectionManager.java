@@ -389,8 +389,10 @@ public class ConnectionManager implements BroadcastInterface {
             set = new HashSet<>();
             listeners.put(userId, set);
 
-            var devices = storage.getObjects(Device.class, new Request(
-                    new Columns.Include("id"), new Condition.Permission(User.class, userId, Device.class)));
+            var devices = userId <= 0
+                    ? storage.getObjects(Device.class, new Request(new Columns.Include("id")))
+                    : storage.getObjects(Device.class, new Request(
+                            new Columns.Include("id"), new Condition.Permission(User.class, userId, Device.class)));
             userDevices.put(userId, devices.stream().map(BaseModel::getId).collect(Collectors.toSet()));
             devices.forEach(device -> deviceUsers.computeIfAbsent(device.getId(), id -> new HashSet<>()).add(userId));
         }

@@ -94,13 +94,18 @@ public final class PositionUtil {
     }
 
     public static List<Position> getLatestPositions(Storage storage, long userId) throws StorageException {
+        var positions = storage.getObjects(Position.class, new Request(
+                new Columns.All(), new Condition.LatestPositions()));
+
+        if (userId <= 0) {
+            return positions;
+        }
+
         var devices = storage.getObjects(Device.class, new Request(
                 new Columns.Include("id"),
                 new Condition.Permission(User.class, userId, Device.class)));
         var deviceIds = devices.stream().map(BaseModel::getId).collect(Collectors.toUnmodifiableSet());
 
-        var positions = storage.getObjects(Position.class, new Request(
-                new Columns.All(), new Condition.LatestPositions()));
         return positions.stream()
                 .filter(position -> deviceIds.contains(position.getDeviceId()))
                 .toList();
