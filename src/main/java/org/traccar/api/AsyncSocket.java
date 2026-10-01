@@ -30,10 +30,13 @@ import org.traccar.model.Position;
 import org.traccar.session.ConnectionManager;
 import org.traccar.storage.Storage;
 import org.traccar.storage.StorageException;
+import org.traccar.storage.query.Columns;
+import org.traccar.storage.query.Request;
 
 import java.nio.channels.ClosedChannelException;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -66,7 +69,16 @@ public class AsyncSocket implements Session.Listener.AutoDemanding, ConnectionMa
         this.session = session;
         try {
             Map<String, Collection<?>> data = new HashMap<>();
-            data.put(KEY_POSITIONS, PositionUtil.getLatestPositions(storage, userId));
+            var positions = PositionUtil.getLatestPositions(storage, userId);
+            data.put(KEY_POSITIONS, positions);
+            if (userId <= 0) {
+                var deviceIds = new HashSet<Long>();
+                positions.forEach(position -> deviceIds.add(position.getDeviceId()));
+                var devices = storage.getObjects(Device.class, new Request(new Columns.Include("id", "name")));
+                data.put(KEY_DEVICES, devices.stream()
+                        .filter(device -> deviceIds.contains(device.getId()))
+                        .toList());
+            }
             sendData(data);
             connectionManager.addListener(userId, this);
         } catch (StorageException e) {
